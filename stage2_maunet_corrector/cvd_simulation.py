@@ -101,6 +101,11 @@ class CVDSimulation(nn.Module):
         severity: 0.0 (normal) to 1.0 (deuteranopia). Default 1.0.
         in01:     True  -> input/output images are in [0, 1] (default).
                   False -> input/output images are in [-1, 1] (MAU-Net tanh).
+        linear_rgb: True (default) -> convert sRGB->linear before the matrix
+                  multiply and back to sRGB after, as the Machado et al. (2009)
+                  model intends (the matrices act on LINEAR RGB). False ->
+                  apply the matrix directly to gamma-encoded sRGB (the previous
+                  behavior; slightly less physically accurate but cheaper).
 
     Input  : image tensor [B, 3, H, W]
     Output : CVD-simulated image tensor, same shape and same range as input.
@@ -109,24 +114,47 @@ class CVDSimulation(nn.Module):
     .to(device) but never receives gradients — this is a fixed transform.
     """
 
-    def __init__(self, severity: float = 1.0, in01: bool = True):
+    def __init__(self, severity: float = 1.0, in01: bool = True,
+                 linear_rgb: bool = True):
         super().__init__()
         self.severity = severity
         self.in01 = in01
+        self.linear_rgb = linear_rgb
         self.register_buffer("matrix", deuteranomaly_matrix(severity))
+
+    @staticmethod
+    def _srgb_to_linear(c):
+        # Standard sRGB EOTF (gamma decode). Differentiable.
+        return torch.where(c <= 0.04045, c / 12.92,
+                           ((c + 0.055) / 1.055).clamp(min=0.0) ** 2.4)
+
+    @staticmethod
+    def _linear_to_srgb(c):
+        c = c.clamp(0.0, 1.0)
+        return torch.where(c <= 0.0031308, c * 12.92,
+                           1.055 * (c ** (1.0 / 2.4)) - 0.055)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         if img.dim() != 4 or img.shape[1] != 3:
             raise ValueError(f"Expected [B,3,H,W], got {tuple(img.shape)}")
 
-        # Bring image to [0,1] for the matrix multiply if needed.
+        # Bring image to [0,1] sRGB for the matrix multiply if needed.
         x = (img + 1.0) * 0.5 if not self.in01 else img
+        x = x.clamp(0.0, 1.0)
+
+        # The Machado matrices are defined on LINEAR RGB. Decode gamma first.
+        if self.linear_rgb:
+            x = self._srgb_to_linear(x)
 
         b, c, h, w = x.shape
         flat = x.reshape(b, c, h * w)                  # [B, 3, H*W]
         # matrix [3,3] applied per-pixel: out_c = sum_c' M[c,c'] * in_c'
         simulated = torch.einsum("ij,bjn->bin", self.matrix, flat)
         simulated = simulated.reshape(b, c, h, w).clamp(0.0, 1.0)
+
+        # Re-encode gamma to get back to sRGB [0,1].
+        if self.linear_rgb:
+            simulated = self._linear_to_srgb(simulated)
 
         # Convert back to the input's range.
         if not self.in01:
